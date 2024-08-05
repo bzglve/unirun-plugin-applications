@@ -3,7 +3,7 @@ mod app_info;
 use std::{cell::RefCell, pin::Pin, rc::Rc};
 
 use app_info::AppInfo;
-use gio::{prelude::*, SocketConnection};
+use gio::prelude::*;
 use glib::{self, clone};
 #[allow(unused_imports)]
 use log::*;
@@ -12,12 +12,12 @@ use unirun_if::{
     socket::{connection, stream_read_future, stream_write_future},
 };
 
-fn handle_get_data<'a>(
+fn handle_get_data(
     hits: Vec<Hit>,
     pack_id: PackageId,
-    connection: &'a SocketConnection,
-    main_loop: &'a glib::MainLoop,
-) -> Pin<Box<dyn std::future::Future<Output = ()> + 'a>> {
+    connection: gio::SocketConnection,
+    main_loop: glib::MainLoop,
+) -> Pin<Box<dyn std::future::Future<Output = ()>>> {
     Box::pin(async move {
         let pack = Package::new(Payload::Result(Ok(pack_id)));
         debug!("Sending {:?}", pack);
@@ -29,6 +29,7 @@ fn handle_get_data<'a>(
         while i < hits.len() {
             let h = hits.get(i).unwrap();
             let pack = Package::new(Payload::Hit(h.clone()));
+            let pack_id = pack.get_id();
 
             debug!("Sending {}", h);
             stream_write_future(&connection.output_stream(), pack)
@@ -51,8 +52,10 @@ fn handle_get_data<'a>(
                     connection.output_stream().clear_pending();
                     return;
                 }
-                Payload::Result(Err(_)) => {
-                    continue;
+                Payload::Result(Err(response_id)) => {
+                    if response_id == pack_id {
+                        continue;
+                    }
                 }
                 Payload::Result(Ok(_)) => {}
                 _ => unreachable!(),
@@ -71,11 +74,11 @@ fn handle_get_data<'a>(
 }
 
 async fn handle_command(
-    command: Command,
+    command: &Command,
     pack_id: PackageId,
-    hits: Rc<RefCell<Vec<(AppInfo, Hit)>>>,
-    connection: &SocketConnection,
-    main_loop: &glib::MainLoop,
+    hits: Rc<RefCell<Vec<(Hit, AppInfo)>>>,
+    connection: gio::SocketConnection,
+    main_loop: glib::MainLoop,
 ) {
     match command {
         Command::GetData(text) => {
@@ -85,38 +88,29 @@ async fn handle_command(
                 AppInfo::search(&text)
             })
             .into_iter()
-            .map(|app_info| (app_info.clone(), Hit::from(app_info)))
+            .map(|app_info| (Hit::from(&app_info), app_info))
             .collect();
 
-            let hits_right = hits.borrow().clone().into_iter().map(|(_, h)| h).collect();
-            handle_get_data(hits_right, pack_id, connection, &main_loop.clone()).await;
+            let hits_left = hits.borrow().clone().into_iter().map(|(h, _)| h).collect();
+            handle_get_data(hits_left, pack_id, connection, main_loop).await;
         }
         Command::Activate(id) => {
             if let Some(app_info) =
                 hits.borrow()
                     .iter()
-                    .find_map(|(a, h)| if h.id == id { Some(a) } else { None })
+                    .find_map(|(h, a)| if h.id == *id { Some(a) } else { None })
             {
-                if let Some(id) = &app_info.id {
-                    info!("Launching: {}", id);
-                    match gio::DesktopAppInfo::new(id)
-                        .unwrap()
-                        .launch(&[], gio::AppLaunchContext::NONE)
-                    {
-                        Ok(_) => stream_write_future(
-                            &connection.output_stream(),
-                            Package::new(Payload::Result(Ok(pack_id))),
-                        )
-                        .await
-                        .unwrap(),
-                        Err(_) => stream_write_future(
-                            &connection.output_stream(),
-                            Package::new(Payload::Result(Err(pack_id))),
-                        )
-                        .await
-                        .unwrap(),
-                    };
-                }
+                stream_write_future(
+                    &connection.output_stream(),
+                    Package::new(Payload::Result(
+                        match app_info.inner.launch(&[], gio::AppLaunchContext::NONE) {
+                            Ok(_) => Ok(pack_id),
+                            Err(_) => Err(pack_id),
+                        },
+                    )),
+                )
+                .await
+                .unwrap();
             }
         }
         Command::Abort => {}
@@ -128,7 +122,7 @@ fn main() -> Result<(), glib::Error> {
     env_logger::init();
 
     let hits = Rc::new(RefCell::new(Vec::new()));
-    let main_loop = Rc::new(glib::MainLoop::new(None, true));
+    let main_loop = glib::MainLoop::new(None, true);
     let conn = connection()?;
 
     glib::spawn_future_local(clone!(
@@ -151,11 +145,11 @@ fn main() -> Result<(), glib::Error> {
                 match &data.payload {
                     Payload::Command(command) => {
                         handle_command(
-                            command.clone(),
+                            command,
                             data.get_id(),
                             hits.clone(),
-                            &conn,
-                            &main_loop,
+                            conn.clone(),
+                            main_loop.clone(),
                         )
                         .await
                     }

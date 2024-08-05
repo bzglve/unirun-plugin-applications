@@ -14,6 +14,8 @@ pub struct AppInfo {
     pub id: Option<String>,
     name: String,
     supported_types: Vec<String>,
+    #[serde(skip)]
+    pub inner: gio::AppInfo,
 }
 
 impl AppInfo {
@@ -66,6 +68,7 @@ where
                 .iter()
                 .map(|t| t.to_string())
                 .collect(),
+            inner: value.into(),
         }
     }
 }
