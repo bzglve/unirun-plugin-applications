@@ -1,20 +1,18 @@
 use std::{fmt::Display, path::PathBuf};
 
 use gio::prelude::IsA;
-use serde::Serialize;
 use unirun_if::package::Hit;
 
-#[derive(Debug, Serialize, Clone)]
+#[derive(Debug, Clone)]
 pub struct AppInfo {
-    commandline: Option<PathBuf>,
+    // commandline: Option<PathBuf>,
     description: Option<String>,
     display_name: String,
     executable: PathBuf,
     icon: Option<String>,
     pub id: Option<String>,
     name: String,
-    supported_types: Vec<String>,
-    #[serde(skip)]
+    // supported_types: Vec<String>,
     pub inner: gio::AppInfo,
 }
 
@@ -53,7 +51,7 @@ where
         use gio::prelude::{AppInfoExt, IconExt};
 
         Self {
-            commandline: value.commandline(),
+            // commandline: value.commandline(),
             description: value.description().map(|s| s.to_string()),
             display_name: value.display_name().to_string(),
             executable: value.executable(),
@@ -63,11 +61,11 @@ where
             },
             id: value.id().map(|s| s.to_string()),
             name: value.name().to_string(),
-            supported_types: value
-                .supported_types()
-                .iter()
-                .map(|t| t.to_string())
-                .collect(),
+            // supported_types: value
+            //     .supported_types()
+            //     .iter()
+            //     .map(|t| t.to_string())
+            //     .collect(),
             inner: value.into(),
         }
     }

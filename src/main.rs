@@ -1,6 +1,6 @@
 mod app_info;
 
-use std::{cell::RefCell, pin::Pin, rc::Rc};
+use std::{cell::RefCell, error::Error, rc::Rc};
 
 use app_info::AppInfo;
 use gio::prelude::*;
@@ -12,118 +12,123 @@ use unirun_if::{
     socket::{connection, stream_read_future, stream_write_future},
 };
 
-fn handle_get_data(
-    hits: Vec<Hit>,
-    pack_id: PackageId,
+const SHOW_ON_EMPTY: bool = false;
+
+async fn send_data(
+    hits: Rc<RefCell<Vec<Hit>>>,
     connection: gio::SocketConnection,
-    main_loop: glib::MainLoop,
-) -> Pin<Box<dyn std::future::Future<Output = ()>>> {
-    Box::pin(async move {
-        let pack = Package::new(Payload::Result(Ok(pack_id)));
-        debug!("Sending {:?}", pack);
-        stream_write_future(&connection.output_stream(), pack)
-            .await
-            .unwrap();
+) -> Result<(), Box<dyn Error>> {
+    'send_data: for hit in hits.borrow().iter() {
+        'send_hit: loop {
+            let hit_package = Package::new(Payload::Hit(hit.clone()));
+            let hit_package_id = hit_package.get_id();
 
-        let mut i = 0;
-        while i < hits.len() {
-            let h = hits.get(i).unwrap();
-            let pack = Package::new(Payload::Hit(h.clone()));
-            let pack_id = pack.get_id();
+            debug!("Sending {}", hit);
+            stream_write_future(&connection.output_stream(), hit_package).await?;
 
-            debug!("Sending {}", h);
-            stream_write_future(&connection.output_stream(), pack)
-                .await
-                .unwrap();
-
-            let response = stream_read_future(&connection.input_stream()).await;
-
-            if response.is_err() {
-                main_loop.quit();
-            }
-            let response = response.unwrap();
-
+            let response = stream_read_future(&connection.input_stream()).await?;
             debug!("Got response: {:?}", response);
 
             match response.payload {
-                Payload::Command(Command::Abort) => {
-                    // FIXME workaround
-                    warn!("ABORTING");
-                    connection.output_stream().clear_pending();
-                    return;
-                }
-                Payload::Result(Err(response_id)) => {
-                    if response_id == pack_id {
-                        continue;
+                Payload::Result(result) => {
+                    if let (response_id, Ok(())) = result {
+                        if response_id == hit_package_id {
+                            break 'send_hit;
+                        }
                     }
                 }
-                Payload::Result(Ok(_)) => {}
+                Payload::Command(Command::Abort) => {
+                    break 'send_data;
+                }
                 _ => unreachable!(),
-            };
-
-            i += 1;
+            }
         }
-
-        stream_write_future(
-            &connection.output_stream(),
-            Package::new(Payload::Command(Command::Abort)),
-        )
-        .await
-        .unwrap();
-    })
+    }
+    Ok(())
 }
 
 async fn handle_command(
     command: &Command,
-    pack_id: PackageId,
-    hits: Rc<RefCell<Vec<(Hit, AppInfo)>>>,
+    id_to_answer: PackageId,
     connection: gio::SocketConnection,
+    apps: Rc<RefCell<Vec<AppInfo>>>,
+    hits: Rc<RefCell<Vec<Hit>>>,
     main_loop: glib::MainLoop,
-) {
-    match command {
-        Command::GetData(text) => {
-            *hits.borrow_mut() = (if text.is_empty() {
-                AppInfo::all()
-            } else {
-                AppInfo::search(&text)
-            })
-            .into_iter()
-            .map(|app_info| (Hit::from(&app_info), app_info))
-            .collect();
+) -> Result<(), Box<dyn Error>> {
+    fn refresh_data(text: &str, apps: Rc<RefCell<Vec<AppInfo>>>, hits: Rc<RefCell<Vec<Hit>>>) {
+        *apps.borrow_mut() = (if text.is_empty() && SHOW_ON_EMPTY {
+            AppInfo::all()
+        } else {
+            AppInfo::search(text)
+        })
+        .into_iter()
+        .collect();
+        *hits.borrow_mut() = apps.borrow().iter().map(Hit::from).collect();
+    }
 
-            let hits_left = hits.borrow().clone().into_iter().map(|(h, _)| h).collect();
-            handle_get_data(hits_left, pack_id, connection, main_loop).await;
+    match command {
+        Command::Quit => {
+            info!("Quit");
+
+            let _ = stream_write_future(
+                &connection.output_stream(),
+                Package::new(Payload::Result((id_to_answer, Ok(())))),
+            )
+            .await;
+
+            main_loop.quit();
         }
-        Command::Activate(id) => {
-            if let Some(app_info) =
-                hits.borrow()
-                    .iter()
-                    .find_map(|(h, a)| if h.id == *id { Some(a) } else { None })
+        Command::Abort => {}
+        Command::GetData(text) => {
+            refresh_data(text, apps.clone(), hits.clone());
+
+            stream_write_future(
+                &connection.output_stream(),
+                Package::new(Payload::Result((id_to_answer, Ok(())))),
+            )
+            .await?;
+
+            send_data(hits.clone(), connection.clone()).await?;
+
+            stream_write_future(
+                &connection.output_stream(),
+                Package::new(Payload::Command(Command::Abort)),
+            )
+            .await?;
+        }
+        Command::Activate(hit_id) => {
+            if let Some(app) = apps
+                .borrow()
+                .iter()
+                .zip(hits.borrow().iter())
+                .find_map(|(a, h)| if h.id == *hit_id { Some(a) } else { None })
             {
                 stream_write_future(
                     &connection.output_stream(),
-                    Package::new(Payload::Result(
-                        match app_info.inner.launch(&[], gio::AppLaunchContext::NONE) {
-                            Ok(_) => Ok(pack_id),
-                            Err(_) => Err(pack_id),
-                        },
-                    )),
+                    Package::new(Payload::Result((id_to_answer, {
+                        let answer = match app.inner.launch(&[], gio::AppLaunchContext::NONE) {
+                            Ok(_) => Ok(()),
+                            Err(e) => Err(format!("{}", e)),
+                        };
+                        debug!("Sending: {:?}", answer);
+                        answer
+                    }))),
                 )
-                .await
-                .unwrap();
+                .await?;
             }
         }
-        Command::Abort => {}
-        _ => unreachable!(),
-    }
+    };
+
+    Ok(())
 }
 
 fn main() -> Result<(), glib::Error> {
     env_logger::init();
 
+    let connection = connection()?;
+    let apps = Rc::new(RefCell::new(Vec::new()));
     let hits = Rc::new(RefCell::new(Vec::new()));
     let main_loop = glib::MainLoop::new(None, true);
-    let conn = connection()?;
 
     glib::spawn_future_local(clone!(
         #[strong]
@@ -132,28 +137,36 @@ fn main() -> Result<(), glib::Error> {
             loop {
                 debug!("Waiting for command");
 
-                let data = match stream_read_future(&conn.input_stream()).await {
-                    Ok(d) => d,
-                    Err(_) => {
-                        // error!("Failed to read data: {}", e);
+                let command_package = stream_read_future(&connection.input_stream())
+                    .await
+                    .unwrap_or_else(|e| {
+                        error!("{}", e);
                         main_loop.quit();
-                        continue;
-                    }
-                };
-                debug!("Received: {:?}", data);
+                        panic!("{}", e)
+                    });
+                let command_package_id = command_package.get_id();
+                debug!("Received: {:?}", command_package);
 
-                match &data.payload {
+                match &command_package.payload {
                     Payload::Command(command) => {
                         handle_command(
                             command,
-                            data.get_id(),
+                            command_package_id,
+                            connection.clone(),
+                            apps.clone(),
                             hits.clone(),
-                            conn.clone(),
                             main_loop.clone(),
                         )
                         .await
+                        .unwrap_or_else(|e| {
+                            error!("{}", e);
+                            main_loop.quit();
+                            panic!("{}", e)
+                        });
                     }
-                    _ => unreachable!(),
+                    _ => {
+                        unreachable!("How to handle this: {:?}?", command_package)
+                    }
                 }
             }
         }
