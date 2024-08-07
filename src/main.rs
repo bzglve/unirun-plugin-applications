@@ -56,13 +56,11 @@ async fn handle_command(
     main_loop: glib::MainLoop,
 ) -> Result<(), Box<dyn Error>> {
     fn refresh_data(text: &str, apps: Rc<RefCell<Vec<AppInfo>>>, hits: Rc<RefCell<Vec<Hit>>>) {
-        *apps.borrow_mut() = (if text.is_empty() && SHOW_ON_EMPTY {
+        *apps.borrow_mut() = if text.is_empty() && SHOW_ON_EMPTY {
             AppInfo::all()
         } else {
             AppInfo::search(text)
-        })
-        .into_iter()
-        .collect();
+        };
         *hits.borrow_mut() = apps.borrow().iter().map(Hit::from).collect();
     }
 
@@ -113,6 +111,15 @@ async fn handle_command(
                         debug!("Sending: {:?}", answer);
                         answer
                     }))),
+                )
+                .await?;
+            } else {
+                stream_write_future(
+                    &connection.output_stream(),
+                    Package::new(Payload::Result((
+                        id_to_answer,
+                        Err("Plugin info: cannot find data by Hit".to_owned()),
+                    ))),
                 )
                 .await?;
             }
